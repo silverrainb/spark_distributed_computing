@@ -1,0 +1,259 @@
+---
+output:
+pdf_document: default
+html_document: default
+---
+<style>
+  p.comment {
+    background-color: #DBDBDB;
+      padding: 10px;
+    border: 1px solid black;
+    margin-left: 25px;
+    border-radius: 5px;
+    font-style: italic;
+  }
+</style>
+  
+  
+<div class='alert alert-info'>
+<h2 class='display-3 text-uppercase'>Spark Distributed Computing</h2>
+
+#### Recommender System
+##### CUNY MSDS DATA 643
+#
+##### Date: 2018/07/09
+##### Author: Rose Koh
+
+</div>
+  
+## {.tabset}
+
+### Introduction
+
+
+#### Goal
+
+<div class="alert alert-info" role="alert"> 
+The goal of this project is to practice distributed recommender system.  We adapt the previous recommender system that was built using jester dataset with `recommenderlab` library.  We work with Apache Spark `sparklyr` and compare the performance with the previous iteration.  We also consider the efficiency of the system and the added complexity of using Spark.
+
+</div>
+
+### Data
+
+
+```{r echo=FALSE, include=FALSE}
+
+library(recommenderlab)
+library(sparklyr)
+
+library(xlsx)
+library(data.table)
+library(knitr)
+library(dplyr)
+```
+
+#### Info
+
+<div class="alert alert-info" role="alert">  
+For this week project, we are using subset of `Jester` data from http://eigentaste.berkeley.edu/dataset/
+
+Jester was developed by Ken Goldberg and his group at UC Berkeley and contains around 6 million ratings of 150 jokes. 
+Compared to the other datasets that we use, Jester is unique in two aspects: 
+
+* it uses continuous ratings from -10 to 10 
+* it has the highest ratings density by an order of magnitude. 
+
+Jester has a density of about 30%, meaning that on average a user has rated 30% of all the jokes.
+
+</div>
+
+#### Preprocessing
+
+<div class="alert alert-info" role="alert">  
+
+* remove the first column that contains number of ratings count per joke
+* change 99 to NA
+
+</div>
+
+```{r}
+jester <- read.xlsx2("data/jester-data-2.xls", "jester-data-2-new", header = F, 
+                     colClasses='numeric',stringsAsFactors=FALSE)
+
+# remove first column
+jester <- jester[ , -1]
+
+# Missing value to NA
+jester[jester==99] <- NA
+
+# Check NA table
+table(is.na(jester))
+
+# Check sparsity
+total = nrow(jester) * ncol(jester)
+count.nan = sum(is.na(jester))
+sparsity = round((total-count.nan)/total,4)
+
+# value chr -> num
+fwrite(jester,"jester")
+jester <- fread("jester",colClasses="numeric")
+
+# index colnames
+names(jester)[1:100] <- paste(1:100)
+
+# NA - ColMean Imputation
+j.means <- colMeans(jester, na.rm = TRUE)
+indx <- which(is.na(jester), arr.ind=TRUE)
+jester[indx] <- j.means[indx[,2]]
+
+# Wide to Long
+jester.long <- melt(as.matrix(jester))
+names(jester.long) <- c("user", "item", "rating")
+head(jester.long)
+dim(jester.long)
+
+# Subset
+sample <- jester[sample.int(nrow(jester), 5000, replace=FALSE), ]
+
+# Wide to Long
+sample.long <- melt(as.matrix(sample))
+names(sample.long) <- c("user", "item", "rating")
+head(sample.long)
+dim(sample.long)
+
+# Create matrix
+matrix <- as.matrix(sample)
+real.rating.mat <- as(matrix, "realRatingMatrix")
+real.rating.mat
+```
+
+### Rec-sys Previous model
+
+#### Start Timer
+
+```{r}
+start.time.proc <- proc.time()
+start.time.sys <- Sys.time()
+```
+
+#### Evaluation
+
+```{r}
+items.to.keep <- 15
+rating.threshold <- 1
+number.of.trial <- 3
+method = "split"
+eval.method <- evaluationScheme(real.rating.mat, method=method, train=0.75, 
+                                k=number.of.trial, 
+                                given=items.to.keep, 
+                                goodRating=rating.threshold )
+eval.method
+```
+
+#### Model Selection
+
+```{r}
+rec.model <- Recommender(getData(eval.method, "train"), "UBCF", parameter = list(method = "pearson", normalize = "Z-score"))
+```
+
+#### Prediction
+```{r}
+pred.ubcf = predict(rec.model, getData(eval.method, "known"), type="ratings", n=10)
+```
+
+
+#### End Timer
+
+```{r}
+end.time.proc <- proc.time() - start.time.proc
+end.time.proc
+end.time.sys <- Sys.time() - start.time.sys
+end.time.sys
+```
+
+
+### Rec-sys model in Spark env
+
+#### Start Timer
+
+```{r}
+spark.start.sys <- Sys.time()
+spark.start.proc <- proc.time()
+```
+
+#### Configuration and Connection
+```{r}
+# Construct spark environment
+options(sparklyr.java8 = TRUE)
+
+Sys.setenv(JAVA_HOME = "/Library/Java/JavaVirtualMachines/jdk1.8.0_171.jdk/Contents/Home")
+#Sys.getenv("JAVA_HOME")
+
+Sys.setenv(SPARK_HOME = "/Users/rosekoh/spark/spark-2.3.0-bin-hadoop2.7")
+#spark_home_dir()
+
+# Connect to local spark
+sc <- spark_connect(master='local')
+```
+
+#### Load Data
+
+```{r}
+jester.spark <- sdf_copy_to(sc, sample.long, 'jester_spark', overwrite=TRUE)
+head(jester.spark, 10)
+```
+
+#### Model Selection
+
+```{r}
+# Model - ALS factorization
+implicit.model <- ml_als_factorization(jester.spark, 
+                                       iter.max = 10, 
+                                       regularization.parameter = 0.01, 
+                                       implicit.preferences = TRUE, 
+                                       alpha = 1.0)
+summary(implicit.model)
+```
+
+#### Prediction
+
+```{r}
+# Predictions
+imp.pred <- implicit.model$.jobj %>%
+  invoke("transform", spark_dataframe(jester.spark)) %>%
+  collect()
+
+imp.pred <- data.frame(imp.pred)
+imp.pred[1:10,]
+```
+
+#### End Timer
+```{r}
+# Stop timer
+end.spark.sys <- Sys.time() - spark.start.sys
+end.spark.sys
+end.spark.proc <- proc.time() - spark.start.proc
+end.spark.proc
+```
+
+#### Disconnect Spark
+```{r}
+spark_disconnect(sc)
+```
+
+### Conclusion
+
+#### Conclusion
+
+<div class="alert alert-info" role="alert"> 
+`spaklyr` is an R implementation of an interface to Spark.  Spark in itself is a solution that allows us to work with big data ( terabytes or even petabytes) that simply is impossible on a single machine.  If we do not want to work with Spark directly through scala, we would use `sparklyr`.  
+
+In a strict sense, Spark does not necessarily increase computation speed.  If we want to build a model and the data fits into memory on the local machine, it is faster to do so without using Spark.  Spark is a great solution when we move large amounts of data that do not fit into local machine's memory anymore.  Thus for big data scalability, moving to a distributed platform such as spark becomes necessary.
+</div>
+
+
+
+
+### Reference
+#### References
+https://gist.github.com/lukewang1024/659ec27847169086dde8677e25156573
